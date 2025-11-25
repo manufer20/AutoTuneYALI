@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 
 """
-TuneYALI-style cassette designer for Yarrowia lipolytica (W29).
-UPDATED: 
+TruncYALI-style truncation cassette designer for Yarrowia lipolytica (W29).
+UPDATED:
 - Fully Automated: Uses Selenium Robot to check CHOPCHOP.
 - Fallback: Local Doench 2014 if robot fails.
 - Backbone: Restored to original specifications.
+- This script designs truncation cassettes (e.g., deleting the first N bp of an ORF) rather than full-gene knockouts.
 """
 from datetime import datetime
 from dataclasses import dataclass
@@ -523,71 +524,295 @@ def find_best_primer_with_pos(sequence: str, direction: str) -> Tuple[str, int]:
     fallback = seq_to_scan[:20]
     final_seq = fallback if direction == 'fw' else revcomp(fallback)
     return final_seq, 0
-
-def design_knockout(genome: Dict[str, str], gene: GeneInfo, arm_len: int = 162) -> KnockoutDesign:
+def design_truncation(
+    genome: Dict[str, str],
+    gene: GeneInfo,
+    trunc_len: int,
+    arm_len: int = 162
+) -> KnockoutDesign:
     """
-    Designs cassette + "Out-Out" Primers + Calculates PCR Band Sizes.
+    TruncYALI design:
+      - Assume a 1 kb promoter upstream of the ATG (or downstream for '-' strand).
+      - User chooses trunc_len (50–500 bp), which is the length of promoter
+        we KEEP closest to the ATG.
+      - We delete the distal part of the promoter and use:
+          UP  arm:  162 bp outside the -1000 border
+          DOWN arm: 162 bp starting at the truncation point X (-trunc_len)
+      - For '-' strand, the same logic is applied in genomic coordinates,
+        then arms are reverse-complemented for the donor.
     """
-    sgrna, search_window = find_sgrna_in_orf(genome, gene)
-    if not sgrna:
-        raise ValueError(f"No suitable sgRNA found for {gene.gene_id}")
-    
-    up, down = extract_homology_arms(genome, gene, arm_len)
     chrom_seq = genome[gene.chrom]
-    
-    # Genomic Boundaries
-    genomic_start_idx = gene.start - 1
-    genomic_end_idx = gene.end
-    gene_len = genomic_end_idx - genomic_start_idx
+    chrom_len = len(chrom_seq)
 
-    # Search Windows (Outside Arms)
+    if trunc_len < 50 or trunc_len > 500:
+        raise ValueError("trunc_len should be between 50 and 500 bp.")
+
+    # -----------------------------
+    # Define promoter and truncation in genomic coordinates (0-based)
+    # -----------------------------
+    if gene.strand == '+':
+        # ORF start (ATG) in 0-based coordinates
+        tss0 = gene.start - 1  # position of the first coding base
+        # Full 1 kb promoter upstream of ATG (clamped to contig start)
+        prom_start0 = max(0, tss0 - 1000)   # corresponds to "-1000"
+        prom_end0 = tss0                    # corresponds to "-1" (exclusive)
+        prom_len = max(0, prom_end0 - prom_start0)
+
+        # Clamp trunc_len so it never exceeds the usable promoter or the arm length
+        max_trunc = max(1, min(prom_len, arm_len - 1))
+        if trunc_len > max_trunc:
+            print(
+                f"[TruncYALI] Requested trunc_len {trunc_len} bp is too long for "
+                f"{gene.gene_id} on '+' strand (promoter {prom_len} bp, arm_len {arm_len} bp). "
+                f"Using trunc_len={max_trunc} bp instead."
+            )
+            trunc_len = max_trunc
+
+        # Truncation point X = -trunc_len → genomic coordinate:
+        # keep [-trunc_len .. -1], so X = tss0 - trunc_len
+        trunc0 = tss0 - trunc_len  # this is the first base we KEEP
+
+        # UP arm: -1000 - 162 → 162 bp immediately upstream of prom_start0
+        up_start = max(0, prom_start0 - arm_len)
+        up_end = prom_start0
+        up_seq = chrom_seq[up_start:up_end]
+
+        # DOWN arm: from -trunc_len (e.g. -50) across the ATG into the ORF by (arm_len - trunc_len)
+        down_start = max(0, tss0 - trunc_len)
+        down_end = min(chrom_len, tss0 + (arm_len - trunc_len))
+        down_seq = chrom_seq[down_start:down_end]
+
+        # Region actually deleted for PCR math: [prom_start0 .. trunc0)
+        del_start = prom_start0
+        del_end = trunc0
+
+    else:
+        # '-' strand: treat everything in an ORF-relative frame, then map to genomic.
+        # r = 0 at the first coding base (ATG), promoter is r in [-1000 .. -1].
+        tss0 = gene.end - 1  # 0-based index of first coding base on '-' strand
+
+        def r_to_g(r: int) -> int:
+            """
+            Map ORF-relative coordinate r to genomic 0-based index.
+            For the minus strand, going 'upstream' in ORF space (more negative r)
+            means increasing genomic coordinate.
+            """
+            return tss0 - r
+
+        # Approximate 1 kb promoter: r = -1000 .. -1.
+        # Compute its span in genomic coordinates and clamp to contig bounds.
+        prom_start_g_raw = r_to_g(-1000)
+        prom_end_g_raw = r_to_g(-1) + 1  # exclusive
+
+        # Normalise order and clamp to chromosome bounds
+        prom_left = max(0, min(prom_start_g_raw, prom_end_g_raw))
+        prom_right = min(chrom_len, max(prom_start_g_raw, prom_end_g_raw))
+        prom_start_g, prom_end_g = prom_left, prom_right
+        prom_len = max(0, prom_end_g - prom_start_g)
+
+        # Clamp trunc_len so it never exceeds usable promoter or arm length
+        max_trunc = max(1, min(prom_len, arm_len - 1))
+        if trunc_len > max_trunc:
+            print(
+                f"[TruncYALI] Requested trunc_len {trunc_len} bp is too long for "
+                f"{gene.gene_id} on '-' strand (promoter {prom_len} bp, arm_len {arm_len} bp). "
+                f"Using trunc_len={max_trunc} bp instead."
+            )
+            trunc_len = max_trunc
+
+        # Truncation boundary at r = -trunc_len (this is the first bp we KEEP in promoter).
+        r_trunc = -trunc_len
+
+        # UP arm: 162 bp just outside the -1000 border → r in [-1000-162 .. -1001]
+        r_up_start = -1000 - arm_len
+        r_up_end = -1000  # exclusive
+        g_up_1 = r_to_g(r_up_start)
+        g_up_2 = r_to_g(r_up_end - 1)
+        up_start_gen = max(0, min(g_up_1, g_up_2))
+        up_end_gen = min(chrom_len, max(g_up_1, g_up_2) + 1)
+        up_seq_gen = chrom_seq[up_start_gen:up_end_gen]
+        # Donor carries reverse complement of genomic segment
+        up_seq = revcomp(up_seq_gen)
+
+        # DOWN arm: 162 bp starting at r = -trunc_len, extending across the ATG
+        # into the ORF (e.g. for trunc_len=50 → [-50 .. +112] in ORF coordinates).
+        r_dn_start = r_trunc
+        r_dn_end = r_trunc + arm_len  # exclusive
+        g_dn_1 = r_to_g(r_dn_start)
+        g_dn_2 = r_to_g(r_dn_end - 1)
+        down_start_gen = max(0, min(g_dn_1, g_dn_2))
+        down_end_gen = min(chrom_len, max(g_dn_1, g_dn_2) + 1)
+        down_seq_gen = chrom_seq[down_start_gen:down_end_gen]
+        down_seq = revcomp(down_seq_gen)
+
+        # Deleted promoter segment corresponds to r in [-1000 .. -trunc_len-1].
+        g_del_1 = r_to_g(-1000)
+        g_del_2 = r_to_g(-trunc_len - 1)
+        del_start = min(g_del_1, g_del_2)
+        del_end = max(g_del_1, g_del_2) + 1
+
+    # -----------------------------
+    # Length of the deleted piece (for band size difference)
+    # -----------------------------
+    deleted_len = max(0, del_end - del_start)
+
+    # -----------------------------
+    # sgRNA selection in the DELETED PROMOTER (not the ORF)
+    # -----------------------------
+    # We want the cut to fall roughly in the first third of the DELETED promoter,
+    # counted from the UP (5′) homology side:
+    #   - For the '+' strand, the UP side is at the more upstream index (del_start,
+    #     corresponding to ~-1000 relative to the ATG).
+    #   - For the '-' strand, the UP side is at the more upstream index in gene
+    #     space, which corresponds to the larger genomic index (del_end - 1).
+    # We define a 200 bp window centered around that 5′-third position and send
+    # ONLY that fragment to CHOPCHOP so that the cut is always close to the UP arm.
+    prom_window = 200
+    window_half = prom_window // 2
+
+    if deleted_len <= 0:
+        raise ValueError(f"Deleted promoter segment has non‑positive length for {gene.gene_id}.")
+
+    if gene.strand == "+":
+        # 5′/UP side is del_start (most upstream base of the deleted promoter).
+        up_index = del_start
+        target_center = up_index + deleted_len // 3
+    else:
+        # 5′/UP side is at the larger genomic index (del_end - 1).
+        up_index = del_end - 1
+        target_center = up_index - deleted_len // 3
+
+    # Clamp target_center to lie strictly inside the deleted segment.
+    target_center = max(del_start, min(del_end - 1, target_center))
+
+    # Define the genomic window used for CHOPCHOP and local fallback.
+    search_start = max(del_start, target_center - window_half)
+    search_end = min(del_end, target_center + window_half)
+    search_window = chrom_seq[search_start:search_end]
+
+    # --- Primary: CHOPCHOP over the deleted promoter window ---
+    sgrna = None
+    guide_seq, robot_score = get_chopchop_guide(search_window, gene.gene_id + "_trunc")
+
+    if guide_seq:
+        # Map the guide back to the genome but RESTRICTED to the promoter window,
+        # so we never pick a hit in the ORF.
+        idx_fwd = chrom_seq.find(guide_seq, search_start, search_end)
+        if idx_fwd != -1 and chrom_seq[idx_fwd + 20: idx_fwd + 23].endswith("GG"):
+            cut_pos = idx_fwd + 18  # same convention as KOYALI
+            sgrna = SgRNA(
+                guide_seq,
+                chrom_seq[idx_fwd + 20: idx_fwd + 23],
+                gene.chrom,
+                cut_pos,
+                "+",
+                robot_score,
+                "CHOPCHOP-Web",
+            )
+        else:
+            # Try reverse‑complement orientation inside the same window.
+            rc = revcomp(guide_seq)
+            idx_rev = chrom_seq.find(rc, search_start, search_end)
+            if (
+                idx_rev != -1
+                and idx_rev >= 3
+                and chrom_seq[idx_rev - 3: idx_rev].startswith("CC")
+            ):
+                cut_pos = idx_rev + 4  # use same minus‑strand convention as in KOYALI
+                sgrna = SgRNA(
+                    guide_seq,
+                    "NGG",
+                    gene.chrom,
+                    cut_pos,
+                    "-",
+                    robot_score,
+                    "CHOPCHOP-Web",
+                )
+
+    # --- Fallback: if CHOPCHOP fails or cannot be mapped, revert to ORF‑based search ---
+    if sgrna is None:
+        print("    [TruncYALI] CHOPCHOP promoter search failed; falling back to ORF‑based guide search.")
+        sgrna, fallback_window = find_sgrna_in_orf(genome, gene)
+        if not sgrna:
+            raise ValueError(f"No suitable sgRNA found for {gene.gene_id}")
+        # For the report, still keep the promoter window if it exists.
+        if search_window:
+            search_window = search_window
+        else:
+            search_window = fallback_window
+
+    # -----------------------------
+    # Primer design OUTSIDE the homology arms (as in KOYALI)
+    # -----------------------------
+    # We'll place primers flanking the entire edit region: from just outside
+    # the UP arm to just outside the DOWN arm, analogous to KOYALI's "out-out" PCR.
+
+    # For simplicity, define the bounding region of the HDR event on the genome.
+    # On '+' this is [up_start .. down_end), on '-' we use the genomic coordinates
+    # we actually took the arms from.
+    if gene.strand == '+':
+        hdr_left = up_start
+        hdr_right = down_end
+    else:
+        # For '-' strand, arms were taken from up_start_gen/up_end_gen and
+        # down_start_gen/down_end_gen.
+        hdr_left = min(up_start_gen, down_start_gen)
+        hdr_right = max(up_end_gen, down_end_gen)
+
+    # Define left and right search windows for primers (outside the HDR region)
+    chrom_seq = genome[gene.chrom]
     search_window_len = 200
-    buffer = 10 
-    
-    # Left Region (Upstream)
-    p_left_end = max(0, genomic_start_idx - arm_len - buffer)
+    buffer = 10
+
+    # Left side
+    p_left_end = max(0, hdr_left - buffer)
     p_left_start = max(0, p_left_end - search_window_len)
-    left_search_seq = chrom_seq[p_left_start : p_left_end]
-    
-    # Right Region (Downstream)
-    p_right_start = min(len(chrom_seq), genomic_end_idx + arm_len + buffer)
-    p_right_end = min(len(chrom_seq), p_right_start + search_window_len)
-    right_search_seq = chrom_seq[p_right_start : p_right_end]
-    
-    # Find Primers & Relative Positions
+    left_search_seq = chrom_seq[p_left_start:p_left_end]
+
+    # Right side
+    p_right_start = min(chrom_len, hdr_right + buffer)
+    p_right_end = min(chrom_len, p_right_start + search_window_len)
+    right_search_seq = chrom_seq[p_right_start:p_right_end]
+
     fw_seq, fw_rel_pos = find_best_primer_with_pos(left_search_seq, 'fw')
     rv_seq, rv_rel_pos = find_best_primer_with_pos(right_search_seq, 'rv')
 
-    # Calculate Genomic Coordinates of Primers
     fw_genomic_start = p_left_start + fw_rel_pos
-    
-    # Rev primer (reverse complement) starts at p_right_start + rv_rel_pos
     rv_genomic_end = p_right_start + rv_rel_pos + len(rv_seq)
 
-    # PCR Math
     band_unedited = rv_genomic_end - fw_genomic_start
-    band_ko = band_unedited - gene_len
+    band_trunc = band_unedited - deleted_len
 
-    fragment_seq = GA_LEFT + sgrna.protospacer.upper() + TRACR_SCAFFOLD + TER_RPR1 + up + down + GA_RIGHT
-    
+    # -----------------------------
+    # Build synthetic fragment:
+    # GA_LEFT – sgRNA – scaffold – terminator – UP – DOWN – GA_RIGHT
+    # -----------------------------
+    fragment_seq = (
+        GA_LEFT
+        + sgrna.protospacer.upper()
+        + TRACR_SCAFFOLD
+        + TER_RPR1
+        + up_seq
+        + down_seq
+        + GA_RIGHT
+    )
+
     primers = [
-        PrimerInfo("KO_VERIFY_FWD", fw_seq, fw_genomic_start, len(fw_seq)),
-        PrimerInfo("KO_VERIFY_REV", rv_seq, rv_genomic_end, len(rv_seq))
+        PrimerInfo("TRUNC_VERIFY_FWD", fw_seq, fw_genomic_start, len(fw_seq)),
+        PrimerInfo("TRUNC_VERIFY_REV", rv_seq, rv_genomic_end, len(rv_seq)),
     ]
-    
+
     return KnockoutDesign(
         gene=gene,
         sgrna=sgrna,
-        upstream_arm=up,
-        downstream_arm=down,
+        upstream_arm=up_seq,
+        downstream_arm=down_seq,
         fragment_seq=fragment_seq,
         primers=primers,
         band_size_unedited=band_unedited,
-        band_size_ko=band_ko,
+        band_size_ko=band_trunc,
         search_window_seq=search_window,
     )
-
-
 # =========================
 # Output Generators
 # =========================
@@ -595,50 +820,50 @@ def design_knockout(genome: Dict[str, str], gene: GeneInfo, arm_len: int = 162) 
 def write_design_report(design: KnockoutDesign, out_path: str) -> None:
     with open(out_path, "w") as f:
         sg = design.sgrna
-        f.write(f"=== TuneYALI Knockout: {design.gene.gene_id} ===\n\n")
+        f.write(f"=== TruncYALI Truncation: {design.gene.gene_id} ===\n\n")
         f.write(f"[Target Details]\n")
         f.write(f"Gene ID: {design.gene.gene_id}\n")
         f.write(f"Method: {sg.method} (Score: {sg.score})\n")
         f.write(f"Cut Pos: {sg.cut_pos} ({sg.strand})\n")
         f.write(f"Protospacer: {sg.protospacer}\n\n")
-        
+
         fwd_oligo = "TTCGATTCCGGGTCGGCGCAGGTTG" + sg.protospacer + "GTTTTA"
         rev_oligo = "GCTCTAAAAC" + revcomp(sg.protospacer) + "CAACCTGCGCCGACCCGGAAT"
         f.write(f"[gRNA Cloning Oligos]\nFwd: {fwd_oligo}\nRev: {rev_oligo}\n\n")
 
         # Insert the CHOPCHOP 200 bp window sequence section
-        f.write(f"[CHOPCHOP 200 bp window (~5' third of ORF)]\n")
+        f.write(f"[CHOPCHOP 200 bp window (~first third of DELETED promoter)]\n")
         f.write("Paste this sequence into CHOPCHOP (FASTA input) if you want to verify the guides manually.\n")
         f.write(f"{design.search_window_seq}\n\n")
-        
-        f.write(f"[Donor Fragment]\n>KO_{design.gene.gene_id}_Donor\n{design.fragment_seq}\n\n")
-        
+
+        f.write(f"[Donor Fragment]\n>TRUNC_{design.gene.gene_id}_Donor\n{design.fragment_seq}\n\n")
+
         f.write("[Verification Primers]\n")
-        f.write("Primers are outside homology arms.\n")
+        f.write("Primers are outside homology arms and detect a size shift corresponding to the deleted 5′ segment.\n")
         for p in design.primers:
             f.write(f"{p.name}: {p.seq} (Len: {p.length})\n")
-            
+
         f.write(f"\n[Expected PCR Bands]\n")
         f.write(f"Unedited/Parental: ~{design.band_size_unedited} bp\n")
-        f.write(f"Successful KO:     ~{design.band_size_ko} bp\n")
+        f.write(f"Truncation allele: ~{design.band_size_ko} bp (shorter by ~{design.band_size_unedited - design.band_size_ko} bp)\n")
 
 
 def write_genbank(design: KnockoutDesign, gb_path: str) -> None:
     record = SeqRecord(
         Seq(design.fragment_seq),
-        id=f"KO_{design.gene.gene_id}_donor",
-        name=f"KO_{design.gene.gene_id}",
-        description=f"TuneYALI KO {design.gene.gene_id}. Check Primers: Unedited~{design.band_size_unedited}bp, KO~{design.band_size_ko}bp."
+        id=f"TRUNC_{design.gene.gene_id}_donor",
+        name=f"TRUNC_{design.gene.gene_id}",
+        description=f"TruncYALI donor for 5' truncation of {design.gene.gene_id}. Expected bands: unedited~{design.band_size_unedited}bp, trunc~{design.band_size_ko}bp."
     )
     today = datetime.today().strftime("%d-%b-%Y").upper()
     record.annotations["molecule_type"] = "DNA"
     record.annotations["topology"] = "linear"
     record.annotations["data_file_division"] = "UNC"
     record.annotations["date"] = today
-    record.annotations["accessions"] = [f"KO_{design.gene.gene_id}_DONOR"]
+    record.annotations["accessions"] = [f"TRUNC_{design.gene.gene_id}_DONOR"]
     record.annotations["source"] = "synthetic DNA construct"
     record.annotations["organism"] = "synthetic construct"
-    record.annotations["comment"] = "Designed with TuneYALI / KOYALI."
+    record.annotations["comment"] = "Designed with TruncYALI."
 
     spacer_len = len(design.sgrna.protospacer)
     modules = [
@@ -658,9 +883,9 @@ def write_genbank(design: KnockoutDesign, gb_path: str) -> None:
             type=f_type,
             qualifiers={
                 "label": [label],
-                "ApEinfo_fwdcolor": [color], 
+                "ApEinfo_fwdcolor": [color],
                 "ApEinfo_revcolor": [color],
-                "note": [f"TuneYALI Module: {label}"]
+                "note": [f"TruncYALI Module: {label}"]
             },
         )
         record.features.append(feature)
@@ -670,8 +895,9 @@ def write_genbank(design: KnockoutDesign, gb_path: str) -> None:
 
 
 def write_png_map(design: KnockoutDesign, png_path: str) -> None:
+    # TruncYALI donor map diagram
     if not HAS_DNA_VIEWER: return
-    
+
     L_ga_left = len(GA_LEFT)
     L_spacer = 20
     L_tracr = len(TRACR_SCAFFOLD)
@@ -740,11 +966,12 @@ def write_gel_simulation(design: KnockoutDesign, gel_path: str) -> None:
 # =========================
 
 def main():
-    parser = argparse.ArgumentParser(description="TuneYALI Designer (Calculated Bands)")
+    parser = argparse.ArgumentParser(description="TruncYALI Designer (Calculated Bands for 5' Truncations)")
     parser.add_argument("--gene_id", required=True, help="Gene ID (e.g. YALI1_B12345g)")
     parser.add_argument("--genome", default="W29_genome.fasta", help="Genome FASTA")
     parser.add_argument("--gff", default="W29_annotation.gff", help="Annotation GFF")
     parser.add_argument("--out", default=None, help="Output Base Name")
+    parser.add_argument("--trunc_len", type=int, default=50, help="Length (bp) to truncate at the 5' end of the ORF (default: 50 bp)")
     args = parser.parse_args()
 
     ensure_reference_files(args.genome, args.gff)
@@ -754,29 +981,29 @@ def main():
     if args.gene_id not in genes:
         raise KeyError(f"Gene {args.gene_id} not found in GFF.")
 
-    print(f"Designing KO for {args.gene_id}...")
-    design = design_knockout(genome, genes[args.gene_id])
-    
-    base = args.out or f"{args.gene_id}_cassette"
+    print(f"Designing 5' truncation for {args.gene_id} (TruncYALI)...")
+    design = design_truncation(genome, genes[args.gene_id], trunc_len=args.trunc_len)
+
+    base = args.out or f"{args.gene_id}_trunc_cassette"
     if base.endswith(".txt"): base = base[:-4]
 
     # Write all outputs
     write_design_report(design, f"{base}.txt")
     write_genbank(design, f"{base}.gb")
     write_png_map(design, f"{base}.png")
-    
+
     # New Gel Simulation
     write_gel_simulation(design, f"{base}_gel.png")
-    
-    print(f"Design Complete for {args.gene_id}")
-    print(f" - Method:        {design.sgrna.method}")
-    print(f" - Score:         {design.sgrna.score}/100")
-    print(f" - Unedited Band: ~{design.band_size_unedited} bp")
-    print(f" - KO Band:       ~{design.band_size_ko} bp")
-    print(f" - Report:        {base}.txt")
-    
+
+    print(f"Design Complete (TruncYALI) for {args.gene_id}")
+    print(f" - Method:             {design.sgrna.method}")
+    print(f" - Score:              {design.sgrna.score}/100")
+    print(f" - Unedited Band:      ~{design.band_size_unedited} bp")
+    print(f" - Truncation Band:    ~{design.band_size_ko} bp")
+    print(f" - Report:             {base}.txt")
+
     if HAS_PYDNA:
-        print(f" - Gel Check:     {base}_gel.png")
+        print(f" - Gel Check:          {base}_gel.png")
 
 if __name__ == "__main__":
     main()
