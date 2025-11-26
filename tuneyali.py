@@ -1,23 +1,41 @@
 #!/usr/bin/env python3
 
 """
-TruncYALI-style truncation cassette designer for Yarrowia lipolytica (W29).
-UPDATED:
-- Fully Automated: Uses Selenium Robot to check CHOPCHOP.
-- Fallback: Local Doench 2014 if robot fails.
-- Backbone: Restored to original specifications.
-- This script designs truncation cassettes (e.g., deleting the first N bp of an ORF) rather than full-gene knockouts.
-- NEW (2025-11): Promoter truncation now respects upstream intergenic constraints
-  on the '+' strand and downstream constraints on the '-' strand:
-    * Uses up to 1 kb as "promoter", but shrinks this window so that the
-      deletion never gets closer than:
-        - 100 bp downstream of the 3' end of an upstream (for '+') or downstream (for '-') gene on the same strand.
-        - 500 bp downstream of the upstream (for '+') or downstream (for '-') "start" of a gene on the opposite strand
-          (approximated by its annotated end, i.e., a divergent partner).
-    * If the safe intergenic region is shorter than 50 bp, TruncYALI refuses to
-      design a truncation and raises a ValueError.
-  NOTE: For '-' strand targets, the same neighbour-aware shrinking is applied on
-  the downstream (genomic +) side, since the 5' promoter lies to the right of the ORF.
+TuneYALI-style promoter insertion cassette designer for Yarrowia lipolytica (W29/CLIB89).
+
+What TuneYALI builds
+--------------------
+This module designs a short-arm HDR donor in the TuneYALI cassette layout:
+
+  GA_LEFT — gRNA (20nt) — tracrRNA scaffold — TerRPR1 — UP arm — [GG INSERT] — DOWN arm — GA_RIGHT
+
+For TuneYALI, the homology arms are anchored around a fixed promoter insertion point
+upstream of the annotated start codon:
+  - UP arm:   (-tune_len-162) .. (-tune_len)   (default tune_len = 500)
+  - DOWN arm: 0 .. +162 (first 162 bp of the ORF)
+
+Between arms, a Golden-Gate placeholder is inserted:
+  GG_INSERT = GACTGAAGAGCTCTTCA
+
+Neighbor-aware safety rules
+--------------------------
+We re-use the same neighbour-aware intergenic safety logic as TruncYALI:
+  * On '+' strand, shrink the usable upstream promoter so the design does not encroach
+    into upstream annotated features (buffers configurable).
+  * On '-' strand, the promoter is downstream in genomic coordinates; shrink the usable
+    downstream promoter to avoid downstream annotated features.
+
+If there is not enough *safe* promoter sequence to support tune_len=500 (i.e. you
+cannot place the UP arm at -662..-500), TuneYALI aborts by default.
+Two opt-in behaviors are provided:
+  - --use_available : reduce tune_len to the maximum allowed by the safe intergenic space
+  - --force         : ignore neighbour-based shrinking (still bounded by contig edges)
+
+Guide selection
+---------------
+The guide is selected inside the promoter region that will be replaced (the proximal
+segment from -tune_len to 0), prioritizing a cut near the UP-arm side of the deleted
+segment. CHOPCHOP is used when available; local Doench-2014 scoring is used as fallback.
 """
 from datetime import datetime
 from dataclasses import dataclass
@@ -87,6 +105,7 @@ TER_RPR1 = "TTTTTTTGTGTGGGTACGGT"
 PROMOTER_SPAN = 1000         # up to 1 kb upstream treated as "promoter"
 BUFFER_SAME_STRAND = 100     # keep ≥100 bp after 3' end of same-strand upstream gene
 BUFFER_OPP_STRAND = 500      # keep ≥500 bp after upstream "start" of opposite strand gene
+GG_INSERT = "GACTGAAGAGCTCTTCA"  # Golden Gate placeholder between UP and DOWN arms
 
 
 # =========================
@@ -668,154 +687,195 @@ def find_best_primer_with_pos(sequence: str, direction: str) -> Tuple[str, int]:
     final_seq = fallback if direction == 'fw' else revcomp(fallback)
     return final_seq, 0
 
-def design_truncation(
+
+def design_tuneyali(
     genome: Dict[str, str],
     gene: GeneInfo,
-    trunc_len: int,
-    arm_len: int = 162
+    tune_len: int = 500,
+    arm_len: int = 162,
+    force: bool = False,
+    use_available: bool = False,
 ) -> KnockoutDesign:
-    """
-    TruncYALI design:
-      - Uses up to a 1 kb promoter upstream of the ATG (or downstream for '-' strand).
-      - User chooses trunc_len (50–500 bp), which is the length of promoter
-        we KEEP closest to the ATG.
-      - We delete the distal part of the promoter and use:
-          UP arm:   ~162 bp immediately outside the distal deletion boundary.
-          DOWN arm: 162 bp starting at the truncation point X (the bp at -trunc_len),
-                    extending into the ORF as needed.
-      - NEW: On the '+' strand, the distal deletion boundary is not allowed to eat
-        into the upstream gene:
-          * At least 100 bp are kept after the 3' end of an upstream same-strand gene.
-          * At least 500 bp are kept after the upstream "start" of an opposite-strand
-            gene (approximated by its annotated end).
-      - For the '-' strand, the original r-coordinate 1 kb promoter logic is kept;
-        you should manually inspect short intergenic regions there.
+    """Design a TuneYALI promoter insertion cassette.
+
+    Default behaviour:
+      - Replace the proximal promoter segment of length `tune_len` (default 500 bp)
+        immediately upstream of the ATG with a Golden-Gate placeholder.
+      - Require enough *safe* promoter sequence to place the UP arm at
+        (-tune_len-162 .. -tune_len). If not available, raise ValueError.
+
+    Optional behaviours:
+      - use_available=True: reduce tune_len to the maximum allowed by the safe space.
+      - force=True: ignore neighbour-aware shrinking (still respects contig boundaries).
+
+    Notes on coordinates:
+      - '+' strand: promoter is upstream (decreasing genomic coordinate).
+      - '-' strand: promoter is downstream (increasing genomic coordinate).
     """
     chrom_seq = genome[gene.chrom]
     chrom_len = len(chrom_seq)
 
-    if trunc_len < 50 or trunc_len > 500:
-        raise ValueError("trunc_len should be between 50 and 500 bp.")
+    if tune_len <= 0:
+        raise ValueError("tune_len must be a positive integer.")
 
     # -----------------------------
-    # Define promoter and truncation in genomic coordinates (0-based)
+    # Determine the usable promoter window with neighbour-aware safety margins
     # -----------------------------
     if gene.strand == '+':
-        # ORF start (ATG) in 0-based coordinates
-        tss0 = gene.start - 1  # position of the first coding base
+        # 0-based index of first coding base
+        tss0 = gene.start - 1
 
-        # Full 1 kb promoter upstream of ATG (clamped to contig start)
-        prom_start0 = max(0, tss0 - PROMOTER_SPAN)   # corresponds to "-PROMOTER_SPAN"
-        prom_end0 = tss0                             # corresponds to "-1" (exclusive)
+        # Nominal promoter span (we only *replace* the proximal tune_len bp, but we still
+        # keep this cap to avoid extending too far if annotation is messy)
+        prom_start0 = max(0, tss0 - PROMOTER_SPAN)
+        prom_end0 = tss0
 
-        # Shrink promoter from upstream side if an annotated feature is close
-        if GENES_BY_CHROM:
-            prom_start0 = adjust_promoter_start_for_neighbors_plus(gene, prom_start0, prom_end0)
+        # -----------------------------
+        # Neighbour-aware safety should constrain the *REPLACED* segment (-tune_len..0),
+        # not the UP homology arm. The UP arm can lie within the "reserved" distal
+        # intergenic/promoter space because it is not edited.
+        # -----------------------------
+        min_del_start = prom_start0
 
-        prom_len = max(0, prom_end0 - prom_start0)
+        if GENES_BY_CHROM and not force:
+            neighbors = GENES_BY_CHROM.get(gene.chrom, [])
+            nearest_end_same: Optional[int] = None
+            nearest_end_opp: Optional[int] = None
 
-        if prom_len < 50:
-            raise ValueError(
-                f"Intergenic region upstream of {gene.gene_id} on '+' strand is too short "
-                f"after safety margins (only {prom_len} bp). TruncYALI cannot design a safe truncation here."
-            )
+            for g2 in neighbors:
+                if g2.gene_id == gene.gene_id:
+                    continue
+                # only fully upstream features (end <= target start)
+                if g2.end <= gene.start:
+                    if g2.strand == gene.strand:
+                        if nearest_end_same is None or g2.end > nearest_end_same:
+                            nearest_end_same = g2.end
+                    else:
+                        if nearest_end_opp is None or g2.end > nearest_end_opp:
+                            nearest_end_opp = g2.end
 
-        # Clamp trunc_len so it never exceeds the usable promoter or the arm length
-        max_trunc = min(prom_len, arm_len - 1)
-        if max_trunc < 50:
-            raise ValueError(
-                f"Safe promoter length upstream of {gene.gene_id} is only {prom_len} bp; "
-                f"cannot keep ≥50 bp of promoter and still perform a clean truncation."
-            )
+            if nearest_end_same is not None:
+                min_del_start = max(min_del_start, nearest_end_same + BUFFER_SAME_STRAND)
+            if nearest_end_opp is not None:
+                min_del_start = max(min_del_start, nearest_end_opp + BUFFER_OPP_STRAND)
 
-        if trunc_len > max_trunc:
-            print(
-                f"[TruncYALI] Requested trunc_len {trunc_len} bp is too long for "
-                f"{gene.gene_id} on '+' strand (safe promoter {prom_len} bp, arm_len {arm_len} bp). "
-                f"Using trunc_len={max_trunc} bp instead."
-            )
-            trunc_len = max_trunc
+        # Ensure the replacement window fits inside the safe intergenic space
+        # del_start is the first base we REPLACE (0-based)
+        del_start = tss0 - tune_len
+        if del_start < min_del_start:
+            if use_available:
+                new_tune = tss0 - min_del_start
+                if new_tune <= 0:
+                    raise ValueError(
+                        f"TuneYALI cannot be designed for {gene.gene_id}: safe replaceable promoter "
+                        f"length is {tss0 - min_del_start} bp (<=0) after neighbour buffers."
+                    )
+                print(
+                    f"[TuneYALI] Safe replaceable promoter upstream of {gene.gene_id} is {tss0 - min_del_start} bp; "
+                    f"shrinking tune_len to {new_tune} bp (--use_available)."
+                )
+                tune_len = new_tune
+                del_start = tss0 - tune_len
+            else:
+                raise ValueError(
+                    f"TuneYALI cannot be designed safely for {gene.gene_id}: replaceable promoter length "
+                    f"upstream of ATG is {tss0 - min_del_start} bp but needs at least tune_len={tune_len} bp. "
+                    f"Use --use_available to shrink automatically, or --force to ignore neighbour constraints."
+                )
 
-        # Truncation point X = -trunc_len → genomic coordinate:
-        # keep [-trunc_len .. -1], so X = tss0 - trunc_len
-        trunc0 = tss0 - trunc_len  # this is the first base we KEEP in the promoter
+        # Now place the UP arm immediately upstream of del_start
+        up_start = del_start - arm_len
+        if up_start < 0:
+            if use_available:
+                new_tune = max(1, tss0 - arm_len)
+                if new_tune < tune_len:
+                    print(
+                        f"[TuneYALI] UP arm would extend beyond contig start for {gene.gene_id}; "
+                        f"shrinking tune_len from {tune_len} to {new_tune} bp (--use_available)."
+                    )
+                    tune_len = new_tune
+                    del_start = tss0 - tune_len
+                    up_start = del_start - arm_len
+            else:
+                raise ValueError(
+                    f"TuneYALI cannot be designed for {gene.gene_id}: UP arm would extend beyond contig start. "
+                    f"Use --use_available to shrink tune_len, or --force with a smaller --tune_len."
+                )
 
-        # UP arm: 162 bp immediately upstream of the (safety-adjusted) promoter,
-        # i.e., outside the deleted region on the distal side.
-        up_start = max(0, prom_start0 - arm_len)
-        up_end = prom_start0
+        up_end = del_start
         up_seq = chrom_seq[up_start:up_end]
 
-        # DOWN arm: from X (e.g. -50) across the ATG into the ORF by (arm_len - trunc_len)
-        down_start = max(0, tss0 - trunc_len)
-        down_end = min(chrom_len, tss0 + (arm_len - trunc_len))
+        down_start = tss0
+        down_end = min(chrom_len, tss0 + arm_len)
         down_seq = chrom_seq[down_start:down_end]
 
-        # Region actually deleted for PCR math: [prom_start0 .. trunc0)
-        del_start = prom_start0
-        del_end = trunc0
+        # Deleted/replaced promoter segment: [del_start .. tss0)
+        del_end = tss0
+
+        hdr_left = up_start
+        hdr_right = down_end
 
     else:
-        # '-' strand targets: the 5' promoter lies downstream in genomic coordinates
-        # (to the right of the ORF). We therefore define the promoter window as the
-        # next PROMOTER_SPAN bp immediately after the ORF, then shrink its distal
-        # boundary if a downstream neighbour is close.
-
-        # First promoter base immediately upstream of the ATG is at 0-based index gene.end.
+        # '-' strand: promoter lies downstream of the ORF in genomic coordinates.
+        # prom_start0 is the first base immediately upstream of the ATG in gene coordinates.
+        # In plus-strand coordinates, that is the first base after the ORF: index gene.end.
         prom_start0 = min(chrom_len, gene.end)
         prom_end0 = min(chrom_len, prom_start0 + PROMOTER_SPAN)
-
-        if GENES_BY_CHROM:
+        if GENES_BY_CHROM and not force:
             prom_end0 = adjust_promoter_end_for_neighbors_minus(gene, prom_start0, prom_end0)
 
         prom_len = max(0, prom_end0 - prom_start0)
-        if prom_len < 50:
+        required = tune_len + arm_len
+        if prom_len < required:
+            if use_available:
+                tune_len = prom_len - arm_len
+                if tune_len <= 0:
+                    raise ValueError(
+                        f"TuneYALI cannot be designed for {gene.gene_id}: safe promoter length "
+                        f"is {prom_len} bp, which is insufficient even for the UP arm."
+                    )
+                print(
+                    f"[TuneYALI] Safe promoter downstream of {gene.gene_id} is {prom_len} bp; "
+                    f"shrinking tune_len to {tune_len} bp (--use_available)."
+                )
+            else:
+                raise ValueError(
+                    f"TuneYALI cannot be designed safely for {gene.gene_id}: safe promoter length "
+                    f"is {prom_len} bp but needs at least {required} bp for tune_len={tune_len}. "
+                    f"Use --use_available to shrink automatically, or --force to ignore neighbour constraints."
+                )
+
+        # UP arm is distal (further from ATG) -> starts at prom_start0 + tune_len
+        up_start_gen = prom_start0 + tune_len
+        up_end_gen = min(chrom_len, up_start_gen + arm_len)
+        if up_end_gen - up_start_gen != arm_len:
             raise ValueError(
-                f"Intergenic region downstream of {gene.gene_id} on '-' strand is too short "
-                f"after safety margins (only {prom_len} bp). TruncYALI cannot design a safe truncation here."
+                f"TuneYALI cannot be designed for {gene.gene_id}: UP arm would extend beyond contig end."
             )
-
-        # Clamp trunc_len so it never exceeds the usable promoter or the arm length.
-        max_trunc = min(prom_len, arm_len - 1)
-        if max_trunc < 50:
-            raise ValueError(
-                f"Safe promoter length downstream of {gene.gene_id} is only {prom_len} bp; "
-                f"cannot keep ≥50 bp of promoter and still perform a clean truncation."
-            )
-
-        if trunc_len > max_trunc:
-            print(
-                f"[TruncYALI] Requested trunc_len {trunc_len} bp is too long for "
-                f"{gene.gene_id} on '-' strand (safe promoter {prom_len} bp, arm_len {arm_len} bp). "
-                f"Using trunc_len={max_trunc} bp instead."
-            )
-            trunc_len = max_trunc
-
-        # We KEEP the proximal trunc_len bp closest to the ATG, i.e. [prom_start0 .. prom_start0+trunc_len).
-        # We DELETE the distal promoter segment: [prom_start0+trunc_len .. prom_end0).
-        del_start = prom_start0 + trunc_len
-        del_end = prom_end0
-
-        # UP arm: ~arm_len bp immediately outside the distal deletion boundary (downstream of prom_end0).
-        up_start_gen = prom_end0
-        up_end_gen = min(chrom_len, prom_end0 + arm_len)
         up_seq_gen = chrom_seq[up_start_gen:up_end_gen]
         up_seq = revcomp(up_seq_gen)
 
-        # DOWN arm: total ~arm_len bases starting at the truncation point towards the ORF.
-        # This arm spans (trunc_len bp promoter kept) + (arm_len - trunc_len bp ORF) across the ATG junction.
-        orf_take = arm_len - trunc_len
-        orf_left = max(0, gene.end - orf_take)  # gene.end is a valid slice end (0-based exclusive)
-        down_seq_gen = chrom_seq[orf_left: gene.end + trunc_len]
+        # DOWN arm is 0..+162 of ORF in gene orientation (i.e. last 162 bp of ORF in genomic plus coords)
+        down_end_gen = gene.end  # 0-based slice end immediately after the ORF
+        down_start_gen = max(0, down_end_gen - arm_len)
+        down_seq_gen = chrom_seq[down_start_gen:down_end_gen]
+        if len(down_seq_gen) != arm_len:
+            raise ValueError(
+                f"TuneYALI cannot be designed for {gene.gene_id}: ORF is too close to contig start for DOWN arm."
+            )
         down_seq = revcomp(down_seq_gen)
 
-    # -----------------------------
-    # Length of the deleted piece (for band size difference)
-    # -----------------------------
+        # Deleted/replaced promoter segment is proximal: [prom_start0 .. prom_start0+tune_len)
+        del_start = prom_start0
+        del_end = prom_start0 + tune_len
+
+        hdr_left = down_start_gen
+        hdr_right = up_end_gen
+
     deleted_len = max(0, del_end - del_start)
 
     # -----------------------------
-    # sgRNA selection in the DELETED PROMOTER (not the ORF)
+    # sgRNA selection in the promoter segment that will be replaced
     # -----------------------------
     prom_window = 200
     window_half = prom_window // 2
@@ -824,21 +884,19 @@ def design_truncation(
         raise ValueError(f"Deleted promoter segment has non-positive length for {gene.gene_id}.")
 
     if gene.strand == "+":
-        up_index = del_start
-        target_center = up_index + deleted_len // 3
+        # UP edge of deleted segment is del_start (more upstream)
+        target_center = del_start + deleted_len // 3
     else:
-        up_index = del_end - 1
-        target_center = up_index - deleted_len // 3
+        # For '-', promoter is to the right; UP edge corresponds to del_end-1
+        target_center = (del_end - 1) - deleted_len // 3
 
     target_center = max(del_start, min(del_end - 1, target_center))
-
     search_start = max(del_start, target_center - window_half)
     search_end = min(del_end, target_center + window_half)
     search_window = chrom_seq[search_start:search_end]
 
-    # --- Primary: CHOPCHOP over the deleted promoter window ---
     sgrna = None
-    guide_seq, robot_score = get_chopchop_guide(search_window, gene.gene_id + "_trunc")
+    guide_seq, robot_score = get_chopchop_guide(search_window, gene.gene_id + "_tune")
 
     if guide_seq:
         idx_fwd = chrom_seq.find(guide_seq, search_start, search_end)
@@ -872,39 +930,24 @@ def design_truncation(
                     "CHOPCHOP-Web",
                 )
 
-    # --- Fallback: if CHOPCHOP fails or cannot be mapped, revert to ORF-based search ---
     if sgrna is None:
-        print("    [TruncYALI] CHOPCHOP promoter search failed; falling back to ORF-based guide search.")
+        print("    [TuneYALI] CHOPCHOP promoter search failed; falling back to ORF-based guide search.")
         sgrna, fallback_window = find_sgrna_in_orf(genome, gene)
         if not sgrna:
             raise ValueError(f"No suitable sgRNA found for {gene.gene_id}")
-        if search_window:
-            search_window = search_window
-        else:
+        if not search_window:
             search_window = fallback_window
 
     # -----------------------------
-    # Primer design OUTSIDE the homology arms
+    # Primer design outside the HDR span
     # -----------------------------
-    if gene.strand == '+':
-        hdr_left = max(0, up_start)
-        hdr_right = min(chrom_len, down_end)
-    else:
-        # For '-' strand promoter truncations, the HDR span runs from the left edge of
-        # the DOWN arm genomic segment up to the right edge of the UP arm genomic segment.
-        hdr_left = max(0, gene.end - (arm_len - trunc_len))
-        hdr_right = min(chrom_len, (prom_end0 + arm_len))
-
-    chrom_seq = genome[gene.chrom]
     search_window_len = 200
     buffer = 10
 
-    # Left side
     p_left_end = max(0, hdr_left - buffer)
     p_left_start = max(0, p_left_end - search_window_len)
     left_search_seq = chrom_seq[p_left_start:p_left_end]
 
-    # Right side
     p_right_start = min(chrom_len, hdr_right + buffer)
     p_right_end = min(chrom_len, p_right_start + search_window_len)
     right_search_seq = chrom_seq[p_right_start:p_right_end]
@@ -916,28 +959,28 @@ def design_truncation(
     rv_genomic_end = p_right_start + rv_rel_pos + len(rv_seq)
 
     band_unedited = rv_genomic_end - fw_genomic_start
-    band_trunc = band_unedited - deleted_len
+    # Edited size depends on what is inserted via Golden Gate. Here we report the
+    # "empty" placeholder insertion case (GG_INSERT only).
+    band_edited = band_unedited - deleted_len + len(GG_INSERT)
 
-    # -----------------------------
-    # Build synthetic fragment:
-    # GA_LEFT – sgRNA – scaffold – terminator – UP – DOWN – GA_RIGHT
-    # -----------------------------
     fragment_seq = (
         GA_LEFT
         + sgrna.protospacer.upper()
         + TRACR_SCAFFOLD
         + TER_RPR1
         + up_seq
+        + GG_INSERT
         + down_seq
         + GA_RIGHT
     )
 
     primers = [
-        PrimerInfo("TRUNC_VERIFY_FWD", fw_seq, fw_genomic_start, len(fw_seq)),
-        PrimerInfo("TRUNC_VERIFY_REV", rv_seq, rv_genomic_end, len(rv_seq)),
+        PrimerInfo("TUNE_VERIFY_FWD", fw_seq, fw_genomic_start, len(fw_seq)),
+        PrimerInfo("TUNE_VERIFY_REV", rv_seq, rv_genomic_end, len(rv_seq)),
     ]
 
-    return KnockoutDesign(
+    # For reporting
+    design = KnockoutDesign(
         gene=gene,
         sgrna=sgrna,
         upstream_arm=up_seq,
@@ -945,9 +988,10 @@ def design_truncation(
         fragment_seq=fragment_seq,
         primers=primers,
         band_size_unedited=band_unedited,
-        band_size_ko=band_trunc,
+        band_size_ko=band_edited,
         search_window_seq=search_window,
     )
+    return design
 
 # =========================
 # Output Generators
@@ -956,7 +1000,7 @@ def design_truncation(
 def write_design_report(design: KnockoutDesign, out_path: str) -> None:
     with open(out_path, "w") as f:
         sg = design.sgrna
-        f.write(f"=== TruncYALI Truncation: {design.gene.gene_id} ===\n\n")
+        f.write(f"=== TuneYALI Promoter-Insertion Cassette: {design.gene.gene_id} ===\n\n")
         f.write(f"[Target Details]\n")
         f.write(f"Gene ID: {design.gene.gene_id}\n")
         f.write(f"Method: {sg.method} (Score: {sg.score})\n")
@@ -971,7 +1015,7 @@ def write_design_report(design: KnockoutDesign, out_path: str) -> None:
         f.write("Paste this sequence into CHOPCHOP (FASTA input) if you want to verify the guides manually.\n")
         f.write(f"{design.search_window_seq}\n\n")
 
-        f.write(f"[Donor Fragment]\n>TRUNC_{design.gene.gene_id}_Donor\n{design.fragment_seq}\n\n")
+        f.write(f"[Donor Fragment]\n>TUNE_{design.gene.gene_id}_Donor\n{design.fragment_seq}\n\n")
 
         f.write("[Verification Primers]\n")
         f.write("Primers are outside homology arms and detect a size shift corresponding to the deleted 5′ segment.\n")
@@ -980,25 +1024,32 @@ def write_design_report(design: KnockoutDesign, out_path: str) -> None:
 
         f.write(f"\n[Expected PCR Bands]\n")
         f.write(f"Unedited/Parental: ~{design.band_size_unedited} bp\n")
-        f.write(f"Truncation allele: ~{design.band_size_ko} bp (shorter by ~{design.band_size_unedited - design.band_size_ko} bp)\n")
+        f.write(
+            f"Edited (placeholder only): ~{design.band_size_ko} bp "
+            f"(delta: {design.band_size_ko - design.band_size_unedited} bp)\n"
+        )
+        f.write(
+            "NOTE: In TuneYALI, the final edited band size depends on the length of the promoter "
+            "inserted by Golden Gate. The value above assumes only the GG placeholder is present.\n"
+        )
 
 
 def write_genbank(design: KnockoutDesign, gb_path: str) -> None:
     record = SeqRecord(
         Seq(design.fragment_seq),
-        id=f"TRUNC_{design.gene.gene_id}_donor",
-        name=f"TRUNC_{design.gene.gene_id}",
-        description=f"TruncYALI donor for 5' truncation of {design.gene.gene_id}. Expected bands: unedited~{design.band_size_unedited}bp, trunc~{design.band_size_ko}bp."
+        id=f"TUNE_{design.gene.gene_id}_donor",
+        name=f"TUNE_{design.gene.gene_id}",
+        description=f"TuneYALI donor for promoter insertion of {design.gene.gene_id}. Expected bands: unedited~{design.band_size_unedited}bp, edited~{design.band_size_ko}bp."
     )
     today = datetime.today().strftime("%d-%b-%Y").upper()
     record.annotations["molecule_type"] = "DNA"
     record.annotations["topology"] = "linear"
     record.annotations["data_file_division"] = "UNC"
     record.annotations["date"] = today
-    record.annotations["accessions"] = [f"TRUNC_{design.gene.gene_id}_DONOR"]
+    record.annotations["accessions"] = [f"TUNE_{design.gene.gene_id}_DONOR"]
     record.annotations["source"] = "synthetic DNA construct"
     record.annotations["organism"] = "synthetic construct"
-    record.annotations["comment"] = "Designed with TruncYALI."
+    record.annotations["comment"] = "Designed with TuneYALI."
 
     spacer_len = len(design.sgrna.protospacer)
     modules = [
@@ -1007,6 +1058,7 @@ def write_genbank(design: KnockoutDesign, gb_path: str) -> None:
         (len(TRACR_SCAFFOLD), "misc_feature", "tracrRNA_scaffold", "#0000FF"),
         (len(TER_RPR1), "terminator", "TerRPR1", "#800080"),
         (len(design.upstream_arm), "misc_recomb", f"UP_{design.gene.gene_id}", "#008000"),
+        (len(GG_INSERT), "misc_feature", "GG_INSERT", "#FFA500"),
         (len(design.downstream_arm), "misc_recomb", f"DOWN_{design.gene.gene_id}", "#006400"),
         (len(GA_RIGHT), "misc_feature", "GA_right", "#808080"),
     ]
@@ -1020,7 +1072,7 @@ def write_genbank(design: KnockoutDesign, gb_path: str) -> None:
                 "label": [label],
                 "ApEinfo_fwdcolor": [color],
                 "ApEinfo_revcolor": [color],
-                "note": [f"TruncYALI Module: {label}"]
+                "note": [f"TuneYALI Module: {label}"]
             },
         )
         record.features.append(feature)
@@ -1037,6 +1089,7 @@ def write_png_map(design: KnockoutDesign, png_path: str) -> None:
     L_tracr = len(TRACR_SCAFFOLD)
     L_term = len(TER_RPR1)
     L_up = len(design.upstream_arm)
+    L_insert = len(GG_INSERT)
     L_down = len(design.downstream_arm)
     L_ga_right = len(GA_RIGHT)
 
@@ -1048,6 +1101,7 @@ def write_png_map(design: KnockoutDesign, png_path: str) -> None:
         (L_tracr, "#0000FF", "Scaffold"),
         (L_term, "#800080", "Term"),
         (L_up, "#008000", "UP Arm"),
+        (L_insert, "#FFA500", "GG_INSERT"),
         (L_down, "#006400", "DOWN Arm"),
         (L_ga_right, "#808080", "GA_right")
     ]
@@ -1099,12 +1153,27 @@ def write_gel_simulation(design: KnockoutDesign, gel_path: str) -> None:
 
 def main():
     global BUFFER_SAME_STRAND, BUFFER_OPP_STRAND
-    parser = argparse.ArgumentParser(description="TruncYALI Designer (Calculated Bands for 5' Truncations)")
+    parser = argparse.ArgumentParser(description="TuneYALI Designer (Golden-Gate promoter insertion cassette)")
     parser.add_argument("--gene_id", required=True, help="Gene ID (e.g. YALI1_B12345g)")
     parser.add_argument("--genome", default="W29_genome.fasta", help="Genome FASTA")
     parser.add_argument("--gff", default="W29_annotation.gff", help="Annotation GFF")
     parser.add_argument("--out", default=None, help="Output Base Name")
-    parser.add_argument("--trunc_len", type=int, default=50, help="Promoter bases to KEEP closest to the ATG (bp). The distal upstream region is deleted (default: 50).")
+    parser.add_argument(
+        "--tune_len",
+        type=int,
+        default=500,
+        help="Length (bp) of proximal promoter to REPLACE upstream of the ATG (default: 500).",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Ignore neighbour-aware safety shrinking (still bounded by contig edges).",
+    )
+    parser.add_argument(
+        "--use_available",
+        action="store_true",
+        help="If not enough safe promoter exists for tune_len, shrink tune_len to the maximum allowed.",
+    )
     parser.add_argument(
         "--buffer_same_strand",
         type=int,
@@ -1136,10 +1205,16 @@ def main():
     ALL_GENES = genes
     GENES_BY_CHROM = index_genes_by_chrom(genes)
 
-    print(f"Designing 5' truncation for {args.gene_id} (TruncYALI)...")
-    design = design_truncation(genome, genes[args.gene_id], trunc_len=args.trunc_len)
+    print(f"Designing TuneYALI promoter insertion cassette for {args.gene_id}...")
+    design = design_tuneyali(
+        genome,
+        genes[args.gene_id],
+        tune_len=args.tune_len,
+        force=args.force,
+        use_available=args.use_available,
+    )
 
-    base = args.out or f"{args.gene_id}_trunc_cassette"
+    base = args.out or f"{args.gene_id}_tune_cassette"
     if base.endswith(".txt"): base = base[:-4]
 
     write_design_report(design, f"{base}.txt")
@@ -1147,11 +1222,11 @@ def main():
     write_png_map(design, f"{base}.png")
     write_gel_simulation(design, f"{base}_gel.png")
 
-    print(f"Design Complete (TruncYALI) for {args.gene_id}")
+    print(f"Design Complete (TuneYALI) for {args.gene_id}")
     print(f" - Method:             {design.sgrna.method}")
     print(f" - Score:              {design.sgrna.score}/100")
     print(f" - Unedited Band:      ~{design.band_size_unedited} bp")
-    print(f" - Truncation Band:    ~{design.band_size_ko} bp")
+    print(f" - Edited Band (placeholder):    ~{design.band_size_ko} bp")
     print(f" - Report:             {base}.txt")
 
     if HAS_PYDNA:
