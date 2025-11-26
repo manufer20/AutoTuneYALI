@@ -13,7 +13,7 @@ Current modules:
 
 - **`koyali.py` (KOYALI)** – clean ORF deletions (start→stop codon)  
 - **`truncyali.py` (TruncYALI)** – 5′ promoter truncations (e.g. keep last 50 bp)  
-- **`tuneyali.py` (TuneYALI)** – promoter-tuning libraries (not yet stable)
+- **`tuneyali.py` (TuneYALI)** – promoter-tuning libraries
 
 > Defaults target **W29/CLIB89 (RefSeq GCF_001761485.1)** and are intended for
 > Δku70 / NHEJ-deficient strains with genomic Cas9. Any FASTA+GFF pair can be used
