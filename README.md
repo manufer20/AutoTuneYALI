@@ -6,7 +6,7 @@ Automated design of CRISPR/Cas9 + HDR editing cassettes for *Yarrowia lipolytica
 **AutoTuneYALI generates (per target locus):**
 * A TuneYALI-style cassette sequence (GA_LEFT → gRNA → scaffold → TerRPR1 → arms → GA_RIGHT)
 * Verification primers (out–out PCR) + expected band sizes
-* Optional cassette-map PNG (`dna-features-viewer`)
+* Optional cassette-map PNG (`dna_features_viewer`)
 * Optional simulated gel PNG (`pydna`)
 
 ### Modules
@@ -23,7 +23,7 @@ Automated design of CRISPR/Cas9 + HDR editing cassettes for *Yarrowia lipolytica
 Each module typically writes:
 * `<base>.txt` — guide, cut site, arms, primers, expected PCR bands, CHOPCHOP window (for manual verification)
 * `<base>.gb` — GenBank of the cassette (annotated features)
-* `<base>.png` — cassette map (optional; requires `dna-features-viewer`)
+* `<base>.png` — cassette map (optional; requires `dna_features_viewer`)
 * `<base>_gel.png` — simulated gel (optional; requires `pydna`)
 
 ### Reference files (W29)
@@ -67,14 +67,14 @@ conda activate autotuneyali
 
 **5) Install dependencies (choose minimal vs complete)**
 
-*Windows minimal (recommended): no pydna and no dna-features-viewer*
+*Windows minimal (recommended): no pydna and no dna_features_viewer*
 ```powershell
 conda install -y -c conda-forge biopython requests pandas matplotlib selenium webdriver-manager
 ```
 
 *Optional extras (only if you want cassette map / gel simulation outputs):*
 ```powershell
-conda install -y -c conda-forge dna-features-viewer
+conda install -y -c conda-forge dna_features_viewer
 conda install -y -c conda-forge pydna
 ```
 
@@ -109,7 +109,7 @@ conda activate autotuneyali
 
 **5) Install dependencies (complete)**
 ```bash
-conda install -y -c conda-forge biopython requests pandas matplotlib selenium webdriver-manager dna-features-viewer pydna
+conda install -y -c conda-forge biopython requests pandas matplotlib selenium webdriver-manager dna_features_viewer pydna
 ```
 
 **6) Quick sanity check**
@@ -205,7 +205,7 @@ If Selenium automation fails (or is blocked), the scripts fall back to local gui
 
 **Optional outputs not generated**
 If you don’t install the optional packages:
-* Cassette maps (`.png`) will be skipped without `dna-features-viewer`.
+* Cassette maps (`.png`) will be skipped without `dna_features_viewer`.
 * Gel simulations (`_gel.png`) will be skipped without `pydna`.
 
 **“Gene not found in GFF”**
