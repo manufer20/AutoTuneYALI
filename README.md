@@ -147,12 +147,12 @@ python .\koyali.py --gene_id YALI1_A09949g
 ```bash
 cd ~/Desktop/AutoTuneYALI
 conda activate autotuneyali
-python ./koyali.py --gene_id YALI1_A09949g
+python koyali.py --gene_id YALI1_A09949g
 ```
 
 **Optional: set output base name:**
 ```bash
-python ./koyali.py --gene_id YALI1_A09949g --out YALI1_A09949g_KO
+python koyali.py --gene_id YALI1_A09949g --out YALI1_A09949g_KO
 ```
 
 ### TruncYALI (promoter truncation; neighbor-aware)
@@ -165,7 +165,7 @@ python ./koyali.py --gene_id YALI1_A09949g --out YALI1_A09949g_KO
 
 **Basic usage:**
 ```bash
-python ./truncyali.py --gene_id YALI1_A09949g
+python truncyali.py --gene_id YALI1_A09949g
 ```
 
 **Overrides (if supported):**
@@ -174,7 +174,7 @@ python ./truncyali.py --gene_id YALI1_A09949g
 
 **Example:**
 ```bash
-python ./truncyali.py --gene_id YALI1_A09949g --prom_len 300 --term_len 150
+python truncyali.py --gene_id YALI1_A09949g --prom_len 300 --term_len 150
 ```
 
 ### TuneYALI (Golden Gate promoter insertion placeholder)
@@ -193,7 +193,7 @@ python ./truncyali.py --gene_id YALI1_A09949g --prom_len 300 --term_len 150
 
 **Basic usage:**
 ```bash
-python ./tuneyali.py --gene_id YALI1_A09949g
+python tuneyali.py --gene_id YALI1_A09949g
 ```
 
 ---
